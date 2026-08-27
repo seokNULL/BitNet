@@ -14,8 +14,6 @@ Examples:
     # Download everything (large! see --list for sizes)
     python download_models.py --all --convert
 
-Prerequisite for --convert: run `python setup_env.py ...` once first so that
-build/bin/llama-quantize exists.
 """
 
 import argparse
@@ -28,7 +26,7 @@ from pathlib import Path
 
 logger = logging.getLogger("download_models")
 
-# kind: "llm"        -> convert via utils/convert-hf-to-gguf-bitnet.py (f32) + llama-quantize (i2_s)
+# kind: "llm"        -> convert via utils/convert-hf-to-gguf-bitnet.py (--outtype i2_s)
 #       "embedding"  -> convert via utils/convert-bitnet-embedding-to-gguf.py (i2_s)
 #       "gguf"       -> repository already ships ggml-model-i2_s.gguf, nothing to convert
 # size is the approximate download size.
@@ -180,7 +178,7 @@ def download(short, models_dir):
     return run([hf_cli(), "download", info["repo"], "--local-dir", local_dir])
 
 
-def convert(short, models_dir, quant_embd=False, keep_f32=False):
+def convert(short, models_dir, quant_embd=False):
     info = MODELS[short]
     local_dir = os.path.join(models_dir, short)
     i2s_path = os.path.join(local_dir, "ggml-model-i2_s.gguf")
@@ -196,30 +194,12 @@ def convert(short, models_dir, quant_embd=False, keep_f32=False):
         return run([sys.executable, "utils/convert-bitnet-embedding-to-gguf.py",
                     local_dir, "--outtype", "i2_s", "--outfile", i2s_path])
 
-    # llm: safetensors -> f32 gguf -> i2_s gguf (same pipeline as setup_env.py)
-    quantize_bin = os.path.join("build", "bin", "llama-quantize")
-    if not os.path.exists(quantize_bin):
-        logger.error("%s not found. Run 'python setup_env.py' once to build bitnet.cpp first.", quantize_bin)
-        return False
-
-    f32_path = os.path.join(local_dir, "ggml-model-f32.gguf")
-    if not (os.path.exists(f32_path) and os.path.getsize(f32_path) > 0):
-        if not run([sys.executable, "utils/convert-hf-to-gguf-bitnet.py", local_dir, "--outtype", "f32"]):
-            return False
-
-    quant_cmd = [quantize_bin]
+    # llm: quantize to i2_s directly in the converter (the llama-quantize tool in
+    # the current llama.cpp submodule no longer accepts the I2_S ftype)
+    convert_cmd = [sys.executable, "utils/convert-hf-to-gguf-bitnet.py", local_dir, "--outtype", "i2_s"]
     if quant_embd:
-        quant_cmd += ["--token-embedding-type", "f16"]
-    quant_cmd += [f32_path, i2s_path, "I2_S", "1"]
-    if quant_embd:
-        quant_cmd += ["1"]
-    if not run(quant_cmd):
-        return False
-
-    if not keep_f32:
-        logger.info("Removing intermediate %s", f32_path)
-        os.remove(f32_path)
-    return True
+        convert_cmd.append("--quant-embd")
+    return run(convert_cmd)
 
 
 def list_models():
@@ -238,8 +218,7 @@ def parse_args():
     parser.add_argument("--models-dir", "-d", default="models", help="Directory to store models (default: models)")
     parser.add_argument("--convert", "-c", action="store_true",
                         help="Convert downloaded models to i2_s GGUF (requires a prior setup_env.py build)")
-    parser.add_argument("--quant-embd", action="store_true", help="Keep token embeddings in f16 when quantizing")
-    parser.add_argument("--keep-f32", action="store_true", help="Keep the intermediate f32 GGUF after quantization")
+    parser.add_argument("--quant-embd", action="store_true", help="Also quantize the embedding layer")
     return parser.parse_args()
 
 
@@ -260,7 +239,7 @@ def main():
     for short in targets:
         ok = download(short, args.models_dir)
         if ok and args.convert:
-            ok = convert(short, args.models_dir, quant_embd=args.quant_embd, keep_f32=args.keep_f32)
+            ok = convert(short, args.models_dir, quant_embd=args.quant_embd)
         if not ok:
             failed.append(short)
 
