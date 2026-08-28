@@ -399,18 +399,19 @@ EOF
     # Link flags
     LDFLAGS="-lm -lpthread"
     
-    # Link with pre-built libraries
-    GGML_LIB_DIR="${SCRIPT_DIR}/../build/3rdparty/llama.cpp/ggml/src"
-    GGML_SO="${GGML_LIB_DIR}/libggml.so"
+    # Link with pre-built libraries (ggml_vec_dot_i2_i8_s is exported by
+    # libggml-cpu.so, and the build places the shared libraries in build/bin)
+    GGML_LIB_DIR="${SCRIPT_DIR}/../build/bin"
+    GGML_SO="${GGML_LIB_DIR}/libggml-cpu.so"
     
     if [ ! -f "${GGML_SO}" ]; then
-        echo "❌ Error: Cannot find libggml.so at ${GGML_SO}"
+        echo "❌ Error: Cannot find libggml-cpu.so at ${GGML_SO}"
         echo "Please build the project first with: cmake --build build"
         rm -f "${TEMP_CPP}"
         exit 1
     fi
     
-    LDFLAGS+=" -L${GGML_LIB_DIR} -lggml -Wl,-rpath,${GGML_LIB_DIR}"
+    LDFLAGS+=" -L${GGML_LIB_DIR} -lggml-cpu -lggml-base -Wl,-rpath,${GGML_LIB_DIR}"
     
     # Output binary
     BENCHMARK_BIN="${SCRIPT_DIR}/${BUILD_DIR}/test_gemm_kernel"
@@ -446,7 +447,7 @@ else
 fi
 
 # Set LD_LIBRARY_PATH to include the GGML library directory
-GGML_LIB_DIR="${SCRIPT_DIR}/../build/3rdparty/llama.cpp/ggml/src"
+GGML_LIB_DIR="${SCRIPT_DIR}/../build/bin"
 export LD_LIBRARY_PATH="${GGML_LIB_DIR}:${LD_LIBRARY_PATH}"
 
 echo "Step 2: Running benchmark tests"
