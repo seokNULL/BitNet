@@ -1,12 +1,12 @@
 # ubench — GEMM kernel microbenchmark
 
-Standalone microbenchmark for the `ggml_gemm_i2_i8_s` kernel (the I2_S
-ternary-weight x int8-activation GEMM) exported by `libggml-cpu.so`.
+Microbenchmark for the `ggml_gemm_i2_i8_s` kernel (I2_S ternary-weight ×
+int8-activation GEMM) exported by `libggml-cpu.so` — the code actually
+executed during inference.
 
-Unlike `utils/test_gemm_kernel.sh`, this calls the actual library kernel used
-during inference (no local copy of the kernel source), sweeps a configurable
-size grid, and verifies the kernel output against a scalar reference before
-benchmarking.
+Runs one (n, m, b) configuration and reports per-iteration execution time and
+RAPL energy split into **package** and **DRAM** domains. Threads partition the
+weight-row (m) dimension, the same axis ggml parallelizes during inference.
 
 ## Build
 
@@ -21,34 +21,36 @@ make
 ## Run
 
 ```bash
-./gemm_i2s_ubench                 # default grid, results in gemm_i2s_ubench.csv
-./gemm_i2s_ubench -h              # all options
+./gemm_i2s_ubench -n 4096 -m 4096 -b 1 -i 100 -t 8
 ```
-
-Size parameters (kernel terms):
 
 | flag | meaning | default |
 |---|---|---|
-| `-n` | inner dimension (multiple of 128) | `1024,2048,4096,8192` |
-| `-m` | weight rows = projection output dim | `1024,2048,4096,8192` |
-| `-b` | activation columns = batch / tokens | `1,32,128,512` |
+| `-n` | inner dimension (multiple of 128) | required |
+| `-m` | weight rows = projection output dim | required |
+| `-b` | batch / tokens per call (1 = decode GEMV) | required |
+| `-i` | iterations | 100 |
+| `-t` | threads | 1 |
 
-`b=1` corresponds to single-token decode (GEMV, memory-bound); large `b`
-corresponds to prefill/batched GEMM (compute-bound).
+Example output:
 
-Other options: `-i` max iterations per config, `-t` time budget per config in
-ms, `-o` CSV output path.
-
-Example: measure a specific projection shape (Llama3-8B gate/up, m=14336,
-k=4096) across batch sizes:
-
-```bash
-./gemm_i2s_ubench -n 4096 -m 14336 -b 1,32,128,512 -o llama3_gate_up.csv
+```
+config : n=4096 m=4096 b=1 threads=8 iters=100
+time   : avg 0.0713 ms | min 0.0691 | max 0.0898 | stddev 0.0031  (total 7.2 ms)
+perf   : 470.65 GFLOPS
+energy : package 1.203 J total, 12.031 mJ/iter, 41.85 W avg
+         dram    0.312 J total,  3.118 mJ/iter, 10.84 W avg
 ```
 
-## Output
+## Energy measurement notes
 
-Per config: `avg_ms`, `min_ms`, `stddev_ms`, `GFLOPS` (2·n·m·b / time) and
-effective `GB/s` (weights + activations + output bytes per pass / time).
-The benchmark is single-threaded by design — it measures the kernel itself,
-not ggml's thread-level parallelization.
+Energy comes from Intel RAPL counters under `/sys/class/powercap/intel-rapl*`
+(works on AMD for the package domain too). If the counters are not readable
+the benchmark still runs and prints `energy : unavailable`:
+
+- `energy_uj` is often root-only — run with `sudo`, or
+  `sudo chmod a+r /sys/class/powercap/intel-rapl*/energy_uj*`
+- Virtual machines / containers usually do not expose RAPL at all.
+- RAPL measures the whole package/DRAM, so the numbers include idle power of
+  everything else on the socket; keep the machine otherwise quiet and compare
+  configurations rather than reading absolute values.

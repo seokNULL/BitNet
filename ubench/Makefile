@@ -3,7 +3,7 @@
 # exist in ../build/bin): python setup_env.py ...  or  cmake --build build
 
 CC      ?= cc
-CFLAGS  ?= -O3 -march=native -std=gnu11 -Wall -Wextra
+CFLAGS  ?= -O3 -march=native -std=gnu11 -Wall -Wextra -fopenmp
 LIBDIR  := $(abspath ../build/bin)
 LDFLAGS := -L$(LIBDIR) -lggml-cpu -lggml-base -lm -Wl,-rpath,$(LIBDIR)
 

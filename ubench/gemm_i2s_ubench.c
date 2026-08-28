@@ -1,12 +1,15 @@
 // Microbenchmark for the ggml_gemm_i2_i8_s kernel exported by libggml-cpu.so.
 //
-// Sweeps a grid of (n, m, b) sizes where, in kernel terms:
-//   n = inner dimension (elements per row, must be a multiple of 128)
-//   m = weight rows  (kernel arg nc) -> output dimension of the projection
-//   b = activation columns (kernel arg nr) -> batch / tokens processed at once
+// Runs one (n, m, b) configuration for a given iteration and thread count and
+// reports per-iteration execution time plus RAPL energy split into package
+// and DRAM domains.
 //
-// For each size it reports avg/min/stddev time, GFLOPS and effective memory
-// bandwidth, and appends a row to a CSV file.
+//   n = inner dimension (elements per row, multiple of 128)
+//   m = weight rows -> projection output dimension
+//   b = activation columns -> batch / tokens processed at once
+//
+// Threads partition the m (weight row) dimension, the same axis ggml uses to
+// parallelize this kernel during inference.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,15 +17,13 @@
 #include <stdint.h>
 #include <math.h>
 #include <time.h>
+#include <omp.h>
 
-// From ggml/src/ggml-cpu/ggml-cpu-i2s.h (libggml-cpu.so exports it):
-//   vx = weight data (I2_S, 2-bit packed, nc rows of n/4 bytes)
-//   vy = activation data (int8, nr columns of n bytes)
-//   s  = output, s[col * bs + row]
+// From ggml/src/ggml-cpu/ggml-cpu-i2s.h (exported by libggml-cpu.so):
+//   vx = weights (I2_S packed, nc rows of n/4 bytes), vy = activations
+//   (int8, nr columns of n bytes), s[col * bs + row]
 extern void ggml_gemm_i2_i8_s(int n, float * s, size_t bs,
                               const void * vx, const void * vy, int nr, int nc);
-
-#define MAX_LIST 32
 
 static double now_ms(void) {
     struct timespec ts;
@@ -30,180 +31,193 @@ static double now_ms(void) {
     return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
 }
 
-// Scalar reference for one output element, replicating the kernel's unpacking
-// order: element (bl*128 + g*32 + k) of a row is bits (6-2g)..(7-2g) of packed
-// byte (bl*32 + k), used as an unsigned 2-bit code multiplied by signed int8.
-static float ref_dot(const uint8_t * x_row, const int8_t * y_col, int n) {
-    int32_t acc = 0;
-    for (int bl = 0; bl < n / 128; bl++) {
-        for (int g = 0; g < 4; g++) {
-            for (int k = 0; k < 32; k++) {
-                int code = (x_row[bl * 32 + k] >> (6 - 2 * g)) & 3;
-                acc += code * (int32_t)y_col[bl * 128 + g * 32 + k];
-            }
-        }
-    }
-    return (float)acc;
+// ---------------------------------------------------------------- RAPL energy
+
+#define MAX_RAPL 16
+
+typedef struct {
+    char   path[256];
+    double max_range_uj;
+    double start_uj;
+    int    is_dram;   // 0 = package domain, 1 = dram subdomain
+} rapl_domain;
+
+static rapl_domain rapl[MAX_RAPL];
+static int rapl_count = 0;
+
+static double read_file_double(const char * path) {
+    FILE * f = fopen(path, "r");
+    if (!f) return -1.0;
+    double v = -1.0;
+    if (fscanf(f, "%lf", &v) != 1) v = -1.0;
+    fclose(f);
+    return v;
 }
 
-static int self_test(void) {
-    const int n = 256, m = 8, b = 8;
-    uint8_t * X = aligned_alloc(64, (size_t)m * n / 4);
-    int8_t  * Y = aligned_alloc(64, (size_t)b * n);
-    float   * S = aligned_alloc(64, (size_t)m * b * sizeof(float));
-    if (!X || !Y || !S) return 0;
-
-    srand(12345);
-    for (int i = 0; i < m * n / 4; i++) X[i] = (uint8_t)(rand() & 0xFF);
-    for (int i = 0; i < b * n;     i++) Y[i] = (int8_t)((rand() % 256) - 128);
-    memset(S, 0, (size_t)m * b * sizeof(float));
-
-    ggml_gemm_i2_i8_s(n, S, m, X, Y, b, m);
-
-    int ok = 1;
-    for (int c = 0; c < b && ok; c++) {
-        for (int r = 0; r < m && ok; r++) {
-            float want = ref_dot(X + (size_t)r * n / 4, Y + (size_t)c * n, n);
-            if (S[c * m + r] != want) {
-                fprintf(stderr, "self-test MISMATCH at row=%d col=%d: got %.0f want %.0f\n",
-                        r, c, S[c * m + r], want);
-                ok = 0;
-            }
-        }
-    }
-    free(X); free(Y); free(S);
-    return ok;
+static void rapl_add(const char * dir, int is_dram) {
+    if (rapl_count >= MAX_RAPL) return;
+    rapl_domain * d = &rapl[rapl_count];
+    snprintf(d->path, sizeof(d->path), "%s/energy_uj", dir);
+    if (read_file_double(d->path) < 0) return;   // no read permission or absent
+    char range_path[256];
+    snprintf(range_path, sizeof(range_path), "%s/max_energy_range_uj", dir);
+    d->max_range_uj = read_file_double(range_path);
+    d->is_dram = is_dram;
+    rapl_count++;
 }
 
-static void bench_one(int n, int m, int b, int max_iters, double budget_ms, FILE * csv) {
+// Discover package domains (/sys/class/powercap/intel-rapl:P) and their dram
+// subdomains (intel-rapl:P:S with name "dram").
+static void rapl_init(void) {
+    for (int p = 0; p < 8; p++) {
+        char dir[192], name_path[256], name[64] = {0};
+        snprintf(dir, sizeof(dir), "/sys/class/powercap/intel-rapl:%d", p);
+        snprintf(name_path, sizeof(name_path), "%s/name", dir);
+        FILE * f = fopen(name_path, "r");
+        if (!f) break;
+        if (!fgets(name, sizeof(name), f)) name[0] = 0;
+        fclose(f);
+        if (strncmp(name, "package", 7) == 0 || strncmp(name, "psys", 4) == 0) {
+            rapl_add(dir, 0);
+        }
+        for (int s = 0; s < 8; s++) {
+            char sdir[224];
+            snprintf(sdir, sizeof(sdir), "%s:%d", dir, s);
+            snprintf(name_path, sizeof(name_path), "%s/name", sdir);
+            f = fopen(name_path, "r");
+            if (!f) break;
+            if (!fgets(name, sizeof(name), f)) name[0] = 0;
+            fclose(f);
+            if (strncmp(name, "dram", 4) == 0) rapl_add(sdir, 1);
+        }
+    }
+}
+
+static void rapl_start(void) {
+    for (int i = 0; i < rapl_count; i++) {
+        rapl[i].start_uj = read_file_double(rapl[i].path);
+    }
+}
+
+// Accumulated joules since rapl_start(), split by domain type.
+static void rapl_stop(double * pkg_j, double * dram_j) {
+    *pkg_j = *dram_j = 0.0;
+    for (int i = 0; i < rapl_count; i++) {
+        double end = read_file_double(rapl[i].path);
+        double delta = end - rapl[i].start_uj;
+        if (delta < 0 && rapl[i].max_range_uj > 0) delta += rapl[i].max_range_uj;
+        if (rapl[i].is_dram) *dram_j += delta / 1e6;
+        else                 *pkg_j  += delta / 1e6;
+    }
+}
+
+// ------------------------------------------------------------------ benchmark
+
+// One GEMM call with the m (weight row) dimension split across threads.
+static void gemm_mt(int n, float * S, int m, const uint8_t * X, const int8_t * Y,
+                    int b, int nthreads) {
+    #pragma omp parallel num_threads(nthreads)
+    {
+        int t  = omp_get_thread_num();
+        int nt = omp_get_num_threads();
+        // contiguous row chunks, aligned to 4 (the kernel's row tile)
+        int chunk = ((m / nt) / 4) * 4;
+        int r0 = t * chunk;
+        int r1 = (t == nt - 1) ? m : r0 + chunk;
+        if (r1 > r0) {
+            ggml_gemm_i2_i8_s(n, S + r0, m, X + (size_t)r0 * n / 4, Y, b, r1 - r0);
+        }
+    }
+}
+
+static void usage(const char * prog) {
+    printf("Usage: %s -n <inner_dim> -m <out_dim> -b <batch> [-i <iters>] [-t <threads>]\n", prog);
+    printf("  -n   inner dimension, multiple of 128\n");
+    printf("  -m   weight rows (projection output dim)\n");
+    printf("  -b   batch / tokens per call\n");
+    printf("  -i   iterations (default: 100)\n");
+    printf("  -t   threads (default: 1)\n");
+}
+
+int main(int argc, char ** argv) {
+    int n = 0, m = 0, b = 0, iters = 100, nthreads = 1;
+
+    for (int i = 1; i < argc; i++) {
+        if      (!strcmp(argv[i], "-n") && i + 1 < argc) n = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-m") && i + 1 < argc) m = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-b") && i + 1 < argc) b = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-i") && i + 1 < argc) iters = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-t") && i + 1 < argc) nthreads = atoi(argv[++i]);
+        else { usage(argv[0]); return !!strcmp(argv[i], "-h"); }
+    }
+    if (n <= 0 || m <= 0 || b <= 0 || iters <= 0 || nthreads <= 0) {
+        usage(argv[0]);
+        return 1;
+    }
+    if (n % 128 != 0) {
+        fprintf(stderr, "error: n must be a multiple of 128\n");
+        return 1;
+    }
+
     size_t x_bytes = (size_t)m * n / 4;
     size_t y_bytes = (size_t)b * n;
     size_t s_bytes = (size_t)m * b * sizeof(float);
-
     uint8_t * X = aligned_alloc(64, (x_bytes + 63) / 64 * 64);
     int8_t  * Y = aligned_alloc(64, (y_bytes + 63) / 64 * 64);
     float   * S = aligned_alloc(64, (s_bytes + 63) / 64 * 64);
     if (!X || !Y || !S) {
-        fprintf(stderr, "allocation failed for n=%d m=%d b=%d\n", n, m, b);
-        free(X); free(Y); free(S);
-        return;
+        fprintf(stderr, "allocation failed\n");
+        return 1;
     }
+    srand(42);
     for (size_t i = 0; i < x_bytes; i++) X[i] = (uint8_t)(rand() & 0xFF);
     for (size_t i = 0; i < y_bytes; i++) Y[i] = (int8_t)((rand() % 256) - 128);
     memset(S, 0, s_bytes);
 
-    // warmup
-    for (int i = 0; i < 3; i++) {
-        ggml_gemm_i2_i8_s(n, S, m, X, Y, b, m);
-    }
+    rapl_init();
 
-    // timed iterations: stop at max_iters or when the time budget is spent
-    double sum = 0.0, sum2 = 0.0, tmin = 1e30;
-    int iters = 0;
-    double t_begin = now_ms();
-    while (iters < max_iters && (iters < 5 || now_ms() - t_begin < budget_ms)) {
+    // warmup
+    for (int i = 0; i < 3; i++) gemm_mt(n, S, m, X, Y, b, nthreads);
+
+    double sum = 0.0, sum2 = 0.0, tmin = 1e30, tmax = 0.0;
+    rapl_start();
+    double t_all0 = now_ms();
+    for (int i = 0; i < iters; i++) {
         double t0 = now_ms();
-        ggml_gemm_i2_i8_s(n, S, m, X, Y, b, m);
+        gemm_mt(n, S, m, X, Y, b, nthreads);
         double dt = now_ms() - t0;
         sum += dt; sum2 += dt * dt;
         if (dt < tmin) tmin = dt;
-        iters++;
+        if (dt > tmax) tmax = dt;
     }
+    double total_ms = now_ms() - t_all0;
+    double pkg_j, dram_j;
+    rapl_stop(&pkg_j, &dram_j);
 
     double avg = sum / iters;
     double var = sum2 / iters - avg * avg;
     double sd  = var > 0 ? sqrt(var) : 0.0;
+    double gflops = 2.0 * n * m * b / (avg * 1e6);
 
-    double flops  = 2.0 * n * m * b;                       // multiply-adds
-    double bytes  = (double)x_bytes + y_bytes + s_bytes;   // one full pass
-    double gflops = flops / (avg * 1e6);
-    double gbps   = bytes / (avg * 1e6);
+    printf("config : n=%d m=%d b=%d threads=%d iters=%d\n", n, m, b, nthreads, iters);
+    printf("time   : avg %.4f ms | min %.4f | max %.4f | stddev %.4f  (total %.1f ms)\n",
+           avg, tmin, tmax, sd, total_ms);
+    printf("perf   : %.2f GFLOPS\n", gflops);
 
-    printf("%7d %7d %5d | %5d it | %9.4f %9.4f %8.4f | %8.2f %8.2f\n",
-           n, m, b, iters, avg, tmin, sd, gflops, gbps);
-    if (csv) {
-        fprintf(csv, "%d,%d,%d,%d,%.6f,%.6f,%.6f,%.3f,%.3f\n",
-                n, m, b, iters, avg, tmin, sd, gflops, gbps);
+    if (rapl_count == 0) {
+        printf("energy : unavailable (no readable /sys/class/powercap/intel-rapl* domain;\n");
+        printf("         try running with sudo, or on bare metal)\n");
+    } else {
+        printf("energy : package %.3f J total, %.3f mJ/iter, %.2f W avg\n",
+               pkg_j, pkg_j * 1e3 / iters, pkg_j / (total_ms / 1e3));
+        if (dram_j > 0) {
+            printf("         dram    %.3f J total, %.3f mJ/iter, %.2f W avg\n",
+                   dram_j, dram_j * 1e3 / iters, dram_j / (total_ms / 1e3));
+        } else {
+            printf("         dram    domain not exposed on this CPU\n");
+        }
     }
 
     free(X); free(Y); free(S);
-}
-
-static int parse_list(const char * arg, int * out, int max) {
-    int count = 0;
-    char * copy = strdup(arg);
-    for (char * tok = strtok(copy, ","); tok && count < max; tok = strtok(NULL, ",")) {
-        out[count++] = atoi(tok);
-    }
-    free(copy);
-    return count;
-}
-
-static void usage(const char * prog) {
-    printf("Usage: %s [options]\n", prog);
-    printf("  -n <list>   inner dimensions, comma-separated (default: 1024,2048,4096,8192)\n");
-    printf("              each must be a multiple of 128\n");
-    printf("  -m <list>   weight rows / output dim (default: 1024,2048,4096,8192)\n");
-    printf("  -b <list>   batch / activation columns (default: 1,32,128,512)\n");
-    printf("  -i <num>    max iterations per config (default: 200)\n");
-    printf("  -t <ms>     time budget per config in ms (default: 250)\n");
-    printf("  -o <path>   output CSV file (default: gemm_i2s_ubench.csv)\n");
-    printf("  -h          show this help\n");
-}
-
-int main(int argc, char ** argv) {
-    int ns[MAX_LIST] = {1024, 2048, 4096, 8192};
-    int ms[MAX_LIST] = {1024, 2048, 4096, 8192};
-    int bs[MAX_LIST] = {1, 32, 128, 512};
-    int n_count = 4, m_count = 4, b_count = 4;
-    int max_iters = 200;
-    double budget_ms = 250.0;
-    const char * csv_path = "gemm_i2s_ubench.csv";
-
-    for (int i = 1; i < argc; i++) {
-        if      (!strcmp(argv[i], "-n") && i + 1 < argc) n_count = parse_list(argv[++i], ns, MAX_LIST);
-        else if (!strcmp(argv[i], "-m") && i + 1 < argc) m_count = parse_list(argv[++i], ms, MAX_LIST);
-        else if (!strcmp(argv[i], "-b") && i + 1 < argc) b_count = parse_list(argv[++i], bs, MAX_LIST);
-        else if (!strcmp(argv[i], "-i") && i + 1 < argc) max_iters = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "-t") && i + 1 < argc) budget_ms = atof(argv[++i]);
-        else if (!strcmp(argv[i], "-o") && i + 1 < argc) csv_path = argv[++i];
-        else if (!strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
-        else { fprintf(stderr, "unknown option: %s\n", argv[i]); usage(argv[0]); return 1; }
-    }
-
-    printf("ggml_gemm_i2_i8_s microbenchmark (single thread)\n\n");
-
-    if (!self_test()) {
-        fprintf(stderr, "self-test FAILED, aborting\n");
-        return 1;
-    }
-    printf("self-test passed (kernel output matches scalar reference)\n\n");
-
-    FILE * csv = fopen(csv_path, "w");
-    if (!csv) {
-        fprintf(stderr, "cannot open %s for writing\n", csv_path);
-        return 1;
-    }
-    fprintf(csv, "n,m,b,iters,avg_ms,min_ms,stddev_ms,gflops,gbps\n");
-
-    printf("%7s %7s %5s | %8s | %9s %9s %8s | %8s %8s\n",
-           "n", "m", "b", "iters", "avg_ms", "min_ms", "sd_ms", "GFLOPS", "GB/s");
-    printf("---------------------------------------------------------------------------------\n");
-
-    srand(42);
-    for (int i = 0; i < n_count; i++) {
-        if (ns[i] % 128 != 0) {
-            fprintf(stderr, "skipping n=%d (must be a multiple of 128)\n", ns[i]);
-            continue;
-        }
-        for (int j = 0; j < m_count; j++) {
-            for (int k = 0; k < b_count; k++) {
-                bench_one(ns[i], ms[j], bs[k], max_iters, budget_ms, csv);
-            }
-        }
-    }
-
-    fclose(csv);
-    printf("\nresults written to %s\n", csv_path);
     return 0;
 }
