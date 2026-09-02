@@ -1,4 +1,5 @@
-// Microbenchmark for the ggml_gemm_i2_i8_s kernel exported by libggml-cpu.so.
+// Microbenchmark for the I2_S matmul kernels (ggml_gemm_i2_i8_s /
+// ggml_gemv_i2_i8_s) exported by libggml-cpu.so.
 //
 // Runs one (n, m, b) configuration for a given iteration and thread count and
 // reports per-iteration execution time plus RAPL energy split into package
@@ -23,6 +24,8 @@
 //   vx = weights (I2_S packed, nc rows of n/4 bytes), vy = activations
 //   (int8, nr columns of n bytes), s[col * bs + row]
 extern void ggml_gemm_i2_i8_s(int n, float * s, size_t bs,
+                              const void * vx, const void * vy, int nr, int nc);
+extern void ggml_gemv_i2_i8_s(int n, float * s, size_t bs,
                               const void * vx, const void * vy, int nr, int nc);
 
 static double now_ms(void) {
@@ -113,19 +116,31 @@ static void rapl_stop(double * pkg_j, double * dram_j) {
 
 // ------------------------------------------------------------------ benchmark
 
-// One GEMM call with the m (weight row) dimension split across threads.
-static void gemm_mt(int n, float * S, int m, const uint8_t * X, const int8_t * Y,
-                    int b, int nthreads) {
+// One matmul over b columns, dispatched exactly like ggml-cpu.c does it:
+// the GEMM kernel handles 4 columns at a time and the GEMV kernel takes the
+// leftover columns (so b=1, the decode case, runs through GEMV as in inference).
+// The m (weight row) dimension is split across threads, aligned to 4 rows,
+// which is also how ggml partitions this operation.
+static void matmul_mt(int n, float * S, int m, const uint8_t * X, const int8_t * Y,
+                      int b, int nthreads) {
     #pragma omp parallel num_threads(nthreads)
     {
         int t  = omp_get_thread_num();
         int nt = omp_get_num_threads();
-        // contiguous row chunks, aligned to 4 (the kernel's row tile)
         int chunk = ((m / nt) / 4) * 4;
         int r0 = t * chunk;
         int r1 = (t == nt - 1) ? m : r0 + chunk;
-        if (r1 > r0) {
-            ggml_gemm_i2_i8_s(n, S + r0, m, X + (size_t)r0 * n / 4, Y, b, r1 - r0);
+        int rows = r1 - r0;
+        if (rows > 0) {
+            const uint8_t * x = X + (size_t)r0 * n / 4;
+            float * s = S + r0;
+            int c = 0;
+            for (; c + 4 <= b; c += 4) {
+                ggml_gemm_i2_i8_s(n, s + (size_t)c * m, m, x, Y + (size_t)c * n, 4, rows);
+            }
+            for (; c < b; c++) {
+                ggml_gemv_i2_i8_s(n, s + (size_t)c * m, m, x, Y + (size_t)c * n, 1, rows);
+            }
         }
     }
 }
@@ -177,14 +192,14 @@ int main(int argc, char ** argv) {
     rapl_init();
 
     // warmup
-    for (int i = 0; i < 3; i++) gemm_mt(n, S, m, X, Y, b, nthreads);
+    for (int i = 0; i < 3; i++) matmul_mt(n, S, m, X, Y, b, nthreads);
 
     double sum = 0.0, sum2 = 0.0, tmin = 1e30, tmax = 0.0;
     rapl_start();
     double t_all0 = now_ms();
     for (int i = 0; i < iters; i++) {
         double t0 = now_ms();
-        gemm_mt(n, S, m, X, Y, b, nthreads);
+        matmul_mt(n, S, m, X, Y, b, nthreads);
         double dt = now_ms() - t0;
         sum += dt; sum2 += dt * dt;
         if (dt < tmin) tmin = dt;
