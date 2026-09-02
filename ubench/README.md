@@ -5,7 +5,7 @@ exported by `libggml-cpu.so` — the code actually executed during inference.
 
 `gemm_i2s_ubench` runs one (n, m, b) configuration and reports per-iteration
 execution time and RAPL energy split into **package** and **DRAM** domains.
-`sweep.py` runs a grid of configurations and collects the results into a CSV.
+`sweep.sh` runs a grid of configurations and collects the results into a CSV.
 
 Dispatch mirrors `ggml-cpu.c` exactly: `ggml_gemm_i2_i8_s` processes 4 columns
 at a time and `ggml_gemv_i2_i8_s` handles the leftover columns, so `b=1` (the
@@ -49,7 +49,7 @@ energy : package 1.203 J total, 12.031 mJ/iter, 41.85 W avg
 ## Sweeping many configurations
 
 ```bash
-./sweep.py -n 1024,2048,4096 -m 4096 -b 1 -t 1,2,4,8 -i 100 -o sweep.csv
+./sweep.sh -n 1024,2048,4096 -m 4096 -b 1 -t 1,2,4,8 -i 100 -o sweep.csv
 ```
 
 Each of `-n`, `-m`, `-b`, `-t` takes a comma-separated list; every combination
